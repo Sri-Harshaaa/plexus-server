@@ -26,6 +26,42 @@ const PORT =
     );
 
 
+/*
+ * =============================================================
+ * ANDROID APP LINKS
+ * =============================================================
+ *
+ * Render already gives this service a public HTTPS host. Plexus
+ * uses that host for verified Android App Links.
+ *
+ * ANDROID_APP_CERT_SHA256 may contain one fingerprint or multiple
+ * comma-separated fingerprints (for example debug + release).
+ */
+const ANDROID_APP_PACKAGE =
+    "com.plexus.app";
+
+
+const ANDROID_APP_CERT_SHA256_FINGERPRINTS =
+    String(
+        process.env.ANDROID_APP_CERT_SHA256 ?? ""
+    )
+        .split(
+            ","
+        )
+        .map(
+            value =>
+                value
+                    .trim()
+                    .toUpperCase()
+        )
+        .filter(
+            value =>
+                /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(
+                    value
+                )
+        );
+
+
 const AUTH_CHALLENGE_TTL_MS =
     2 * 60 * 1000;
 
@@ -44,6 +80,32 @@ const CLEANUP_INTERVAL_MS =
  */
 const MAX_QUEUED_PACKETS_PER_RECIPIENT =
     1000;
+
+
+/*
+ * Connection requests / responses are tiny control packets,
+ * but they still need a per-destination safety limit.
+ */
+const MAX_QUEUED_CONNECTION_CONTROL_PER_RECIPIENT =
+    1000;
+
+
+/*
+ * Android currently creates connection request/response packets
+ * with a maximum 30-day lifetime and tolerates up to 5 minutes
+ * of future clock skew. Keep backend validation aligned with that
+ * protocol contract.
+ */
+const CONNECTION_CONTROL_MAX_TTL_MS =
+    30 * 24 * 60 * 60 * 1000;
+
+
+const CONNECTION_CONTROL_MAX_FUTURE_SKEW_MS =
+    5 * 60 * 1000;
+
+
+const CONNECTION_CONTROL_MAX_DISPLAY_NAME_LENGTH =
+    64;
 
 
 /*
@@ -133,6 +195,8 @@ const io =
  * - queuedPackets
  * - deliveryVaccines
  * - pendingAntiPackets
+ * - queuedConnectionRequests
+ * - queuedConnectionResponses
  *
  * It is restored before the HTTP/Socket.IO server starts.
  */
@@ -221,12 +285,41 @@ const pendingAntiPackets =
 
 
 /*
+ * recipientNodeId
+ *      ->
+ * Map<requestId, ConnectionRequestPacket-like object>
+ *
+ * Requests are kept until:
+ *
+ * - a signed response for that request reaches the backend, or
+ * - the request expires.
+ *
+ * Re-emission on reconnect is safe because Android persists and
+ * deduplicates requests by requestId.
+ */
+const queuedConnectionRequests =
+    new Map();
+
+
+/*
+ * requesterNodeId
+ *      ->
+ * Map<responseId, ConnectionResponsePacket-like object>
+ *
+ * Responses are retained until expiry. Android deduplicates them
+ * by responseId / request state, so reconnect delivery is safe.
+ */
+const queuedConnectionResponses =
+    new Map();
+
+
+/*
  * =============================================================
  * DURABLE STATE ENGINE
  * =============================================================
  *
  * To keep this prototype small and make the persistence backend
- * swappable, Plexus serializes only the three durable maps above.
+ * swappable, Plexus serializes the durable maps above.
  *
  * REDIS_URL present:
  *     snapshot is stored atomically in Redis.
@@ -375,7 +468,7 @@ function buildDurableSnapshot() {
 
 
     return {
-        version: 1,
+        version: 2,
         savedAt: Date.now(),
 
         queuedPackets:
@@ -391,6 +484,16 @@ function buildDurableSnapshot() {
         pendingAntiPackets:
             mapOfMapsToObject(
                 pendingAntiPackets
+            ),
+
+        queuedConnectionRequests:
+            mapOfMapsToObject(
+                queuedConnectionRequests
+            ),
+
+        queuedConnectionResponses:
+            mapOfMapsToObject(
+                queuedConnectionResponses
             )
     };
 }
@@ -405,7 +508,10 @@ function restoreDurableSnapshot(
         !snapshot ||
         typeof snapshot !==
         "object" ||
-        snapshot.version !== 1
+        (
+            snapshot.version !== 1 &&
+            snapshot.version !== 2
+        )
     ) {
 
         throw new Error(
@@ -436,6 +542,26 @@ function restoreDurableSnapshot(
         pendingAntiPackets,
         objectToMapOfMaps(
             snapshot.pendingAntiPackets
+        )
+    );
+
+
+    /*
+     * Snapshot v1 did not contain connection control queues.
+     * Missing fields intentionally restore as empty maps.
+     */
+    replaceMapContents(
+        queuedConnectionRequests,
+        objectToMapOfMaps(
+            snapshot.queuedConnectionRequests
+        )
+    );
+
+
+    replaceMapContents(
+        queuedConnectionResponses,
+        objectToMapOfMaps(
+            snapshot.queuedConnectionResponses
         )
     );
 }
@@ -584,7 +710,9 @@ async function initializeDurableState() {
         `[persistence] ${persistenceMode} ready | ` +
         `queued=${countQueuedPackets()} | ` +
         `vaccines=${deliveryVaccines.size} | ` +
-        `pendingAnti=${countPendingAntiPackets()}`
+        `pendingAnti=${countPendingAntiPackets()} | ` +
+        `connectionRequests=${countQueuedConnectionRequests()} | ` +
+        `connectionResponses=${countQueuedConnectionResponses()}`
     );
 }
 
@@ -692,6 +820,48 @@ function countPendingAntiPackets() {
     for (
         const queue
         of pendingAntiPackets.values()
+    ) {
+
+        count +=
+            queue.size;
+    }
+
+
+    return count;
+}
+
+
+function countQueuedConnectionRequests() {
+
+
+    let count =
+        0;
+
+
+    for (
+        const queue
+        of queuedConnectionRequests.values()
+    ) {
+
+        count +=
+            queue.size;
+    }
+
+
+    return count;
+}
+
+
+function countQueuedConnectionResponses() {
+
+
+    let count =
+        0;
+
+
+    for (
+        const queue
+        of queuedConnectionResponses.values()
     ) {
 
         count +=
@@ -843,8 +1013,226 @@ function cleanupExpiredDurableState(
     }
 
 
+    for (
+        const [
+            recipientNodeId,
+            queue
+        ]
+        of queuedConnectionRequests
+    ) {
+
+
+        for (
+            const [
+                requestId,
+                packet
+            ]
+            of queue
+        ) {
+
+
+            if (
+                Number(
+                    packet?.expiresAt
+                ) <= now
+            ) {
+
+
+                queue.delete(
+                    requestId
+                );
+
+
+                changed =
+                    true;
+            }
+        }
+
+
+        if (
+            queue.size === 0
+        ) {
+
+
+            queuedConnectionRequests.delete(
+                recipientNodeId
+            );
+
+
+            changed =
+                true;
+        }
+    }
+
+
+    for (
+        const [
+            requesterNodeId,
+            queue
+        ]
+        of queuedConnectionResponses
+    ) {
+
+
+        for (
+            const [
+                responseId,
+                packet
+            ]
+            of queue
+        ) {
+
+
+            if (
+                Number(
+                    packet?.expiresAt
+                ) <= now
+            ) {
+
+
+                queue.delete(
+                    responseId
+                );
+
+
+                changed =
+                    true;
+            }
+        }
+
+
+        if (
+            queue.size === 0
+        ) {
+
+
+            queuedConnectionResponses.delete(
+                requesterNodeId
+            );
+
+
+            changed =
+                true;
+        }
+    }
+
+
     return changed;
 }
+
+
+/*
+ * =============================================================
+ * ANDROID APP LINK ASSOCIATION
+ * =============================================================
+ *
+ * Android fetches this exact HTTPS path when verifying that this
+ * web host is allowed to open links directly in com.plexus.app.
+ *
+ * IMPORTANT:
+ * - no redirect from this HTTPS route
+ * - Content-Type must be application/json
+ * - fingerprint must match the APK signing certificate
+ */
+app.get(
+    "/.well-known/assetlinks.json",
+    (request, response) => {
+
+
+        if (
+            ANDROID_APP_CERT_SHA256_FINGERPRINTS.length === 0
+        ) {
+
+
+            return response
+                .status(
+                    503
+                )
+                .json({
+                    error: "ANDROID_APP_CERT_SHA256_NOT_CONFIGURED"
+                });
+        }
+
+
+        response
+            .set(
+                "Cache-Control",
+                "public, max-age=300"
+            )
+            .json([
+                {
+                    relation: [
+                        "delegate_permission/common.handle_all_urls"
+                    ],
+
+                    target: {
+                        namespace: "android_app",
+                        package_name: ANDROID_APP_PACKAGE,
+                        sha256_cert_fingerprints:
+                            ANDROID_APP_CERT_SHA256_FINGERPRINTS
+                    }
+                }
+            ]);
+    }
+);
+
+
+/*
+ * =============================================================
+ * CONNECT-LINK BROWSER FALLBACK
+ * =============================================================
+ *
+ * When Plexus is installed and Android App Links verification has
+ * succeeded, Android opens the app instead of this page.
+ *
+ * If Plexus is not installed (or verification has not completed),
+ * the browser lands here instead of showing a 404. The identity is
+ * stored in the URL fragment, so it is never sent to this server.
+ */
+app.get(
+    "/connect",
+    (request, response) => {
+
+
+        response
+            .set(
+                "Cache-Control",
+                "no-store"
+            )
+            .type(
+                "html"
+            )
+            .send(
+                `<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Plexus Connect</title>
+    <meta name="theme-color" content="#050505">
+    <style>
+        * { box-sizing: border-box; }
+        html, body { margin: 0; min-height: 100%; background: #050505; color: #fff; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        body { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+        .card { width: min(440px, 100%); background: #101311; border: 1px solid #1d211e; border-radius: 24px; padding: 30px 26px; text-align: center; box-shadow: 0 18px 70px rgba(0,0,0,.45); }
+        .mark { width: 58px; height: 58px; margin: 0 auto 18px; display: grid; place-items: center; border-radius: 18px; border: 1px solid rgba(77,255,139,.7); background: rgba(77,255,139,.08); color: #4dff8b; font-size: 28px; font-weight: 800; }
+        h1 { margin: 0 0 10px; font-size: 28px; letter-spacing: -.5px; }
+        p { margin: 0; color: #949a96; line-height: 1.55; }
+        .hint { margin-top: 18px; color: #666d68; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <main class="card">
+        <div class="mark">P</div>
+        <h1>Plexus connection link</h1>
+        <p>Open this link on an Android device with Plexus installed to connect with this person.</p>
+        <p class="hint">The shared Plexus identity stays in the URL fragment and is not sent to this server.</p>
+    </main>
+</body>
+</html>`
+            );
+    }
+);
 
 
 /*
@@ -869,6 +1257,10 @@ app.get(
                 deliveryVaccines.size,
             pendingAntiPackets:
                 countPendingAntiPackets(),
+            queuedConnectionRequests:
+                countQueuedConnectionRequests(),
+            queuedConnectionResponses:
+                countQueuedConnectionResponses(),
             persistence:
                 persistenceMode,
             timestamp:
@@ -1224,6 +1616,22 @@ io.on(
                      */
 
                     await flushPendingAntiPackets(
+                        pending.nodeId
+                    );
+
+
+                    /*
+                     * Control-plane packets are offered before queued
+                     * chat ciphertext. In particular, an acceptance can
+                     * establish trust before any message sent immediately
+                     * after that acceptance arrives.
+                     */
+                    await flushConnectionRequests(
+                        pending.nodeId
+                    );
+
+
+                    await flushConnectionResponses(
                         pending.nodeId
                     );
 
@@ -1692,6 +2100,326 @@ io.on(
 
         /*
          * =====================================================
+         * SIGNED CONNECTION REQUEST
+         * =====================================================
+         *
+         * The backend can read public identity metadata, but it
+         * cannot forge a request because the entire request is
+         * signed by senderNodeId's Android-keystore identity key.
+         */
+
+        socket.on(
+            "internet:connection_request",
+            async (
+                packet,
+                acknowledgement
+            ) => {
+
+
+                try {
+
+
+                    const authenticatedIdentity =
+                        authenticatedSockets.get(
+                            socket.id
+                        );
+
+
+                    if (
+                        !authenticatedIdentity
+                    ) {
+
+                        return failAcknowledgement(
+                            socket,
+                            acknowledgement,
+                            "NOT_AUTHENTICATED"
+                        );
+                    }
+
+
+                    const validation =
+                        validateAndVerifyConnectionRequest(
+                            packet
+                        );
+
+
+                    if (
+                        !validation.valid
+                    ) {
+
+                        return failAcknowledgement(
+                            socket,
+                            acknowledgement,
+                            validation.reason
+                        );
+                    }
+
+
+                    const senderNodeId =
+                        normalizeNodeId(
+                            packet.senderNodeId
+                        );
+
+
+                    const recipientNodeId =
+                        normalizeNodeId(
+                            packet.recipientNodeId
+                        );
+
+
+                    if (
+                        senderNodeId !==
+                        authenticatedIdentity.nodeId
+                    ) {
+
+                        return failAcknowledgement(
+                            socket,
+                            acknowledgement,
+                            "CONNECTION_REQUEST_SOURCE_MISMATCH"
+                        );
+                    }
+
+
+                    const queued =
+                        queueConnectionRequest(
+                            recipientNodeId,
+                            packet
+                        );
+
+
+                    /*
+                     * Persist FIRST. Only after the durable write succeeds
+                     * do we acknowledge the sender or offer the request to
+                     * an online recipient.
+                     */
+                    if (
+                        queued
+                    ) {
+
+                        await persistDurableState();
+                    }
+
+
+                    const deliveredToSockets =
+                        emitToNode(
+                            recipientNodeId,
+                            "internet:connection_request",
+                            packet
+                        );
+
+
+                    successfulAcknowledgement(
+                        acknowledgement,
+                        {
+                            accepted: true,
+                            duplicate:
+                                !queued,
+                            queued: true,
+                            destinationOnline:
+                                deliveredToSockets > 0,
+                            deliveredToSockets
+                        }
+                    );
+
+
+                    console.log(
+                        `[connect-request] ${packet.requestId.slice(0, 8)} ` +
+                        `${shortNode(senderNodeId)} -> ` +
+                        `${shortNode(recipientNodeId)} ` +
+                        `duplicate=${!queued} ` +
+                        `online=${deliveredToSockets > 0}`
+                    );
+
+
+                } catch (
+                    error
+                ) {
+
+
+                    console.error(
+                        "[internet:connection_request] error",
+                        error
+                    );
+
+
+                    failAcknowledgement(
+                        socket,
+                        acknowledgement,
+                        "CONNECTION_REQUEST_FAILED"
+                    );
+                }
+            }
+        );
+
+
+        /*
+         * =====================================================
+         * SIGNED CONNECTION RESPONSE
+         * =====================================================
+         *
+         * ACCEPTED / DECLINED is signed by the responder.
+         *
+         * A response may legitimately reach the backend even if
+         * the original request arrived to the responder through
+         * Nearby rather than the internet, so the server does NOT
+         * require a matching queued request to exist.
+         */
+
+        socket.on(
+            "internet:connection_response",
+            async (
+                packet,
+                acknowledgement
+            ) => {
+
+
+                try {
+
+
+                    const authenticatedIdentity =
+                        authenticatedSockets.get(
+                            socket.id
+                        );
+
+
+                    if (
+                        !authenticatedIdentity
+                    ) {
+
+                        return failAcknowledgement(
+                            socket,
+                            acknowledgement,
+                            "NOT_AUTHENTICATED"
+                        );
+                    }
+
+
+                    const validation =
+                        validateAndVerifyConnectionResponse(
+                            packet
+                        );
+
+
+                    if (
+                        !validation.valid
+                    ) {
+
+                        return failAcknowledgement(
+                            socket,
+                            acknowledgement,
+                            validation.reason
+                        );
+                    }
+
+
+                    const requesterNodeId =
+                        normalizeNodeId(
+                            packet.requesterNodeId
+                        );
+
+
+                    const responderNodeId =
+                        normalizeNodeId(
+                            packet.responderNodeId
+                        );
+
+
+                    if (
+                        responderNodeId !==
+                        authenticatedIdentity.nodeId
+                    ) {
+
+                        return failAcknowledgement(
+                            socket,
+                            acknowledgement,
+                            "CONNECTION_RESPONSE_SOURCE_MISMATCH"
+                        );
+                    }
+
+
+                    const queued =
+                        queueConnectionResponse(
+                            requesterNodeId,
+                            packet
+                        );
+
+
+                    /*
+                     * A valid signed response completes the responder-side
+                     * lifecycle of the original request. Remove the server's
+                     * queued copy if it came through this backend.
+                     */
+                    const removedOriginalRequest =
+                        deleteQueuedConnectionRequest(
+                            responderNodeId,
+                            packet.requestId
+                        );
+
+
+                    if (
+                        queued ||
+                        removedOriginalRequest
+                    ) {
+
+                        await persistDurableState();
+                    }
+
+
+                    const deliveredToSockets =
+                        emitToNode(
+                            requesterNodeId,
+                            "internet:connection_response",
+                            packet
+                        );
+
+
+                    successfulAcknowledgement(
+                        acknowledgement,
+                        {
+                            accepted: true,
+                            duplicate:
+                                !queued,
+                            queued: true,
+                            destinationOnline:
+                                deliveredToSockets > 0,
+                            deliveredToSockets
+                        }
+                    );
+
+
+                    console.log(
+                        `[connect-response] ${packet.responseId.slice(0, 8)} ` +
+                        `${shortNode(responderNodeId)} -> ` +
+                        `${shortNode(requesterNodeId)} ` +
+                        `${packet.response} ` +
+                        `duplicate=${!queued} ` +
+                        `online=${deliveredToSockets > 0}`
+                    );
+
+
+                } catch (
+                    error
+                ) {
+
+
+                    console.error(
+                        "[internet:connection_response] error",
+                        error
+                    );
+
+
+                    failAcknowledgement(
+                        socket,
+                        acknowledgement,
+                        "CONNECTION_RESPONSE_FAILED"
+                    );
+                }
+            }
+        );
+
+
+        /*
+         * =====================================================
          * DISCONNECT
          * =====================================================
          */
@@ -2026,6 +2754,535 @@ function validateAndVerifyAntiPacket(
 
         return invalid(
             "ANTI_PACKET_SIGNATURE_INVALID"
+        );
+    }
+
+
+    return valid();
+}
+
+
+/*
+ * =============================================================
+ * CONNECTION CONTROL CRYPTO
+ * =============================================================
+ */
+
+function appendLengthPrefixed(
+    value
+) {
+
+
+    const stringValue =
+        String(
+            value
+        );
+
+
+    return (
+        Buffer.byteLength(
+            stringValue,
+            "utf8"
+        ) +
+        ":" +
+        stringValue +
+        "|"
+    );
+}
+
+
+function buildConnectionRequestSigningPayload(
+    packet
+) {
+
+
+    return Buffer.from(
+
+        "PLEXUS_CONNECTION_REQUEST_V1|" +
+        appendLengthPrefixed(
+            packet.requestId
+        ) +
+        appendLengthPrefixed(
+            packet.senderNodeId
+        ) +
+        appendLengthPrefixed(
+            packet.recipientNodeId
+        ) +
+        appendLengthPrefixed(
+            packet.senderDisplayName
+        ) +
+        appendLengthPrefixed(
+            packet.senderSigningPublicKey
+        ) +
+        appendLengthPrefixed(
+            packet.senderAgreementPublicKey
+        ) +
+        appendLengthPrefixed(
+            packet.createdAt
+        ) +
+        appendLengthPrefixed(
+            packet.expiresAt
+        ),
+
+        "utf8"
+    );
+}
+
+
+function buildConnectionResponseSigningPayload(
+    packet
+) {
+
+
+    return Buffer.from(
+
+        "PLEXUS_CONNECTION_RESPONSE_V1|" +
+        appendLengthPrefixed(
+            packet.requestId
+        ) +
+        appendLengthPrefixed(
+            packet.responseId
+        ) +
+        appendLengthPrefixed(
+            packet.requesterNodeId
+        ) +
+        appendLengthPrefixed(
+            packet.responderNodeId
+        ) +
+        appendLengthPrefixed(
+            packet.response
+        ) +
+        appendLengthPrefixed(
+            packet.responderDisplayName
+        ) +
+        appendLengthPrefixed(
+            packet.responderSigningPublicKey
+        ) +
+        appendLengthPrefixed(
+            packet.responderAgreementPublicKey
+        ) +
+        appendLengthPrefixed(
+            packet.createdAt
+        ) +
+        appendLengthPrefixed(
+            packet.expiresAt
+        ),
+
+        "utf8"
+    );
+}
+
+
+function isUuid(
+    value
+) {
+
+
+    return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
+        .test(
+            normalizeString(
+                value
+            )
+        );
+}
+
+
+function validateConnectionControlTimes(
+    createdAt,
+    expiresAt,
+    now = Date.now()
+) {
+
+
+    if (
+        !Number.isSafeInteger(
+            createdAt
+        ) ||
+        !Number.isSafeInteger(
+            expiresAt
+        ) ||
+        createdAt <= 0 ||
+        expiresAt <= createdAt
+    ) {
+
+        return invalid(
+            "INVALID_CONNECTION_CONTROL_TIMESTAMPS"
+        );
+    }
+
+
+    if (
+        createdAt >
+        now + CONNECTION_CONTROL_MAX_FUTURE_SKEW_MS
+    ) {
+
+        return invalid(
+            "CONNECTION_CONTROL_FROM_FUTURE"
+        );
+    }
+
+
+    if (
+        expiresAt - createdAt >
+        CONNECTION_CONTROL_MAX_TTL_MS
+    ) {
+
+        return invalid(
+            "CONNECTION_CONTROL_TTL_TOO_LARGE"
+        );
+    }
+
+
+    if (
+        expiresAt <= now
+    ) {
+
+        return invalid(
+            "CONNECTION_CONTROL_EXPIRED"
+        );
+    }
+
+
+    return valid();
+}
+
+
+function validateAndVerifyConnectionRequest(
+    packet
+) {
+
+
+    if (
+        !packet ||
+        typeof packet !==
+        "object"
+    ) {
+
+        return invalid(
+            "INVALID_CONNECTION_REQUEST"
+        );
+    }
+
+
+    if (
+        packet.type !==
+            "connection_request" ||
+        Number(
+            packet.version
+        ) !== 1
+    ) {
+
+        return invalid(
+            "UNSUPPORTED_CONNECTION_REQUEST"
+        );
+    }
+
+
+    const requestId =
+        normalizeString(
+            packet.requestId
+        );
+
+
+    const senderNodeId =
+        normalizeNodeId(
+            packet.senderNodeId
+        );
+
+
+    const recipientNodeId =
+        normalizeNodeId(
+            packet.recipientNodeId
+        );
+
+
+    const senderDisplayName =
+        normalizeString(
+            packet.senderDisplayName
+        );
+
+
+    const senderSigningPublicKey =
+        normalizeString(
+            packet.senderSigningPublicKey
+        );
+
+
+    const senderAgreementPublicKey =
+        normalizeString(
+            packet.senderAgreementPublicKey
+        );
+
+
+    const signature =
+        normalizeString(
+            packet.signature
+        );
+
+
+    const createdAt =
+        Number(
+            packet.createdAt
+        );
+
+
+    const expiresAt =
+        Number(
+            packet.expiresAt
+        );
+
+
+    if (
+        !requestId ||
+        !isUuid(
+            requestId
+        ) ||
+        !senderNodeId ||
+        !recipientNodeId ||
+        senderNodeId === recipientNodeId ||
+        !senderDisplayName ||
+        senderDisplayName.length >
+            CONNECTION_CONTROL_MAX_DISPLAY_NAME_LENGTH ||
+        !senderSigningPublicKey ||
+        !senderAgreementPublicKey ||
+        !signature
+    ) {
+
+        return invalid(
+            "INVALID_CONNECTION_REQUEST_FIELDS"
+        );
+    }
+
+
+    const timeValidation =
+        validateConnectionControlTimes(
+            createdAt,
+            expiresAt
+        );
+
+
+    if (
+        !timeValidation.valid
+    ) {
+
+        return timeValidation;
+    }
+
+
+    if (
+        !isValidNodeIdentity(
+            senderNodeId,
+            senderSigningPublicKey
+        )
+    ) {
+
+        return invalid(
+            "CONNECTION_REQUEST_IDENTITY_MISMATCH"
+        );
+    }
+
+
+    const signatureValid =
+        verifyEcdsaSignature(
+
+            buildConnectionRequestSigningPayload(
+                packet
+            ),
+
+            signature,
+
+            senderSigningPublicKey
+        );
+
+
+    if (
+        !signatureValid
+    ) {
+
+        return invalid(
+            "CONNECTION_REQUEST_SIGNATURE_INVALID"
+        );
+    }
+
+
+    return valid();
+}
+
+
+function validateAndVerifyConnectionResponse(
+    packet
+) {
+
+
+    if (
+        !packet ||
+        typeof packet !==
+        "object"
+    ) {
+
+        return invalid(
+            "INVALID_CONNECTION_RESPONSE"
+        );
+    }
+
+
+    if (
+        packet.type !==
+            "connection_response" ||
+        Number(
+            packet.version
+        ) !== 1
+    ) {
+
+        return invalid(
+            "UNSUPPORTED_CONNECTION_RESPONSE"
+        );
+    }
+
+
+    const requestId =
+        normalizeString(
+            packet.requestId
+        );
+
+
+    const responseId =
+        normalizeString(
+            packet.responseId
+        );
+
+
+    const requesterNodeId =
+        normalizeNodeId(
+            packet.requesterNodeId
+        );
+
+
+    const responderNodeId =
+        normalizeNodeId(
+            packet.responderNodeId
+        );
+
+
+    const response =
+        normalizeString(
+            packet.response
+        );
+
+
+    const responderDisplayName =
+        normalizeString(
+            packet.responderDisplayName
+        );
+
+
+    const responderSigningPublicKey =
+        normalizeString(
+            packet.responderSigningPublicKey
+        );
+
+
+    const responderAgreementPublicKey =
+        normalizeString(
+            packet.responderAgreementPublicKey
+        );
+
+
+    const signature =
+        normalizeString(
+            packet.signature
+        );
+
+
+    const createdAt =
+        Number(
+            packet.createdAt
+        );
+
+
+    const expiresAt =
+        Number(
+            packet.expiresAt
+        );
+
+
+    if (
+        !requestId ||
+        !isUuid(
+            requestId
+        ) ||
+        !responseId ||
+        !isUuid(
+            responseId
+        ) ||
+        !requesterNodeId ||
+        !responderNodeId ||
+        requesterNodeId === responderNodeId ||
+        (
+            response !== "ACCEPTED" &&
+            response !== "DECLINED"
+        ) ||
+        !responderDisplayName ||
+        responderDisplayName.length >
+            CONNECTION_CONTROL_MAX_DISPLAY_NAME_LENGTH ||
+        !responderSigningPublicKey ||
+        !responderAgreementPublicKey ||
+        !signature
+    ) {
+
+        return invalid(
+            "INVALID_CONNECTION_RESPONSE_FIELDS"
+        );
+    }
+
+
+    const timeValidation =
+        validateConnectionControlTimes(
+            createdAt,
+            expiresAt
+        );
+
+
+    if (
+        !timeValidation.valid
+    ) {
+
+        return timeValidation;
+    }
+
+
+    if (
+        !isValidNodeIdentity(
+            responderNodeId,
+            responderSigningPublicKey
+        )
+    ) {
+
+        return invalid(
+            "CONNECTION_RESPONSE_IDENTITY_MISMATCH"
+        );
+    }
+
+
+    const signatureValid =
+        verifyEcdsaSignature(
+
+            buildConnectionResponseSigningPayload(
+                packet
+            ),
+
+            signature,
+
+            responderSigningPublicKey
+        );
+
+
+    if (
+        !signatureValid
+    ) {
+
+        return invalid(
+            "CONNECTION_RESPONSE_SIGNATURE_INVALID"
         );
     }
 
@@ -2707,6 +3964,372 @@ async function flushPendingAntiPackets(
      *
      * The sender may reconnect again before expiry.
      * Duplicate suppression on Android makes resending safe.
+     */
+}
+
+
+/*
+ * =============================================================
+ * CONNECTION CONTROL QUEUES
+ * =============================================================
+ */
+
+function queueConnectionControlPacket(
+    outerMap,
+    destinationNodeId,
+    packetId,
+    packet
+) {
+
+
+    const destination =
+        normalizeNodeId(
+            destinationNodeId
+        );
+
+
+    let queue =
+        outerMap.get(
+            destination
+        );
+
+
+    if (
+        !queue
+    ) {
+
+        queue =
+            new Map();
+
+
+        outerMap.set(
+            destination,
+            queue
+        );
+    }
+
+
+    /*
+     * Strict first-wins deduplication.
+     *
+     * If the same signed request/response reaches us again through
+     * retries, do not mutate the already durable copy.
+     */
+    if (
+        queue.has(
+            packetId
+        )
+    ) {
+
+        return false;
+    }
+
+
+    queue.set(
+        packetId,
+        packet
+    );
+
+
+    while (
+        queue.size >
+        MAX_QUEUED_CONNECTION_CONTROL_PER_RECIPIENT
+    ) {
+
+
+        const oldestPacketId =
+            queue
+                .keys()
+                .next()
+                .value;
+
+
+        if (
+            oldestPacketId ===
+            undefined
+        ) {
+
+            break;
+        }
+
+
+        queue.delete(
+            oldestPacketId
+        );
+    }
+
+
+    return true;
+}
+
+
+function queueConnectionRequest(
+    recipientNodeId,
+    packet
+) {
+
+
+    return queueConnectionControlPacket(
+        queuedConnectionRequests,
+        recipientNodeId,
+        packet.requestId,
+        packet
+    );
+}
+
+
+function queueConnectionResponse(
+    requesterNodeId,
+    packet
+) {
+
+
+    return queueConnectionControlPacket(
+        queuedConnectionResponses,
+        requesterNodeId,
+        packet.responseId,
+        packet
+    );
+}
+
+
+function deleteQueuedConnectionRequest(
+    recipientNodeId,
+    requestId
+) {
+
+
+    const recipient =
+        normalizeNodeId(
+            recipientNodeId
+        );
+
+
+    const queue =
+        queuedConnectionRequests.get(
+            recipient
+        );
+
+
+    if (
+        !queue
+    ) {
+
+        return false;
+    }
+
+
+    const deleted =
+        queue.delete(
+            requestId
+        );
+
+
+    if (
+        queue.size === 0
+    ) {
+
+        queuedConnectionRequests.delete(
+            recipient
+        );
+    }
+
+
+    return deleted;
+}
+
+
+async function flushConnectionRequests(
+    nodeId
+) {
+
+
+    const recipient =
+        normalizeNodeId(
+            nodeId
+        );
+
+
+    const queue =
+        queuedConnectionRequests.get(
+            recipient
+        );
+
+
+    if (
+        !queue
+    ) {
+
+        return;
+    }
+
+
+    const now =
+        Date.now();
+
+
+    let changed =
+        false;
+
+
+    for (
+        const [
+            requestId,
+            packet
+        ]
+        of queue
+    ) {
+
+
+        if (
+            Number(
+                packet.expiresAt
+            ) <= now
+        ) {
+
+
+            queue.delete(
+                requestId
+            );
+
+
+            changed =
+                true;
+
+
+            continue;
+        }
+
+
+        emitToNode(
+            recipient,
+            "internet:connection_request",
+            packet
+        );
+    }
+
+
+    if (
+        queue.size === 0
+    ) {
+
+
+        queuedConnectionRequests.delete(
+            recipient
+        );
+
+
+        changed =
+            true;
+    }
+
+
+    if (
+        changed
+    ) {
+
+        await persistDurableState();
+    }
+}
+
+
+async function flushConnectionResponses(
+    nodeId
+) {
+
+
+    const requester =
+        normalizeNodeId(
+            nodeId
+        );
+
+
+    const queue =
+        queuedConnectionResponses.get(
+            requester
+        );
+
+
+    if (
+        !queue
+    ) {
+
+        return;
+    }
+
+
+    const now =
+        Date.now();
+
+
+    let changed =
+        false;
+
+
+    for (
+        const [
+            responseId,
+            packet
+        ]
+        of queue
+    ) {
+
+
+        if (
+            Number(
+                packet.expiresAt
+            ) <= now
+        ) {
+
+
+            queue.delete(
+                responseId
+            );
+
+
+            changed =
+                true;
+
+
+            continue;
+        }
+
+
+        emitToNode(
+            requester,
+            "internet:connection_response",
+            packet
+        );
+    }
+
+
+    if (
+        queue.size === 0
+    ) {
+
+
+        queuedConnectionResponses.delete(
+            requester
+        );
+
+
+        changed =
+            true;
+    }
+
+
+    if (
+        changed
+    ) {
+
+        await persistDurableState();
+    }
+
+
+    /*
+     * Active responses intentionally remain queued until expiry.
+     * Android's response processing is idempotent, so reconnect
+     * re-delivery is preferable to losing an offline acceptance.
      */
 }
 
