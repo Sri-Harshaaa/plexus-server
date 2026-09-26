@@ -1,4 +1,5 @@
 import express from "express";
+import { validateMeshPacket, MAX_PACKET_BYTES } from "./protocol.js";
 import cors from "cors";
 import http from "http";
 import { mkdir, readFile, rename, writeFile } from "fs/promises";
@@ -177,7 +178,7 @@ const io =
             },
 
             maxHttpBufferSize:
-                1024 * 1024
+                MAX_PACKET_BYTES
         }
     );
 
@@ -1279,6 +1280,21 @@ app.get(
 io.on(
     "connection",
     socket => {
+        // Bound event work even for self-created, correctly authenticated identities.
+        let tokens = 256;
+        let lastRefill = Date.now();
+        socket.use(([event, ...args], next) => {
+            const now = Date.now();
+            tokens = Math.min(256, tokens + (now - lastRefill) / 50);
+            lastRefill = now;
+            if (tokens < 1) {
+                const ack = args.at(-1);
+                if (typeof ack === "function") ack({ ok: false, error: "RATE_LIMITED" });
+                return;
+            }
+            tokens -= 1;
+            next();
+        });
 
 
         console.log(
@@ -1331,8 +1347,9 @@ io.on(
 
 
                     if (
-                        !nodeId ||
-                        !signingPublicKey
+                        authenticatedSockets.has(socket.id) ||
+                        !/^[0-9a-f]{64}$/.test(nodeId) ||
+                        !signingPublicKey || signingPublicKey.length > 512
                     ) {
 
                         return failAcknowledgement(
@@ -1807,10 +1824,11 @@ io.on(
                      *
                      * Later this exact interface can move to Redis.
                      */
-                    queueMeshPacket(
-                        destinationNodeId,
-                        packet
-                    );
+                    if (countQueuedPackets() >= 4096 &&
+                        !findQueuedPacket(destinationNodeId, packetId)) {
+                        return failAcknowledgement(socket, acknowledgement, "SERVER_QUEUE_FULL");
+                    }
+                    queueMeshPacket(destinationNodeId, packet);
 
 
                     /*
@@ -2015,10 +2033,20 @@ io.on(
                     /*
                      * Store backend vaccine first.
                      */
-                    deliveryVaccines.set(
-                        messageId,
-                        antiPacket
-                    );
+                    const existingVaccine = deliveryVaccines.get(messageId);
+                    if (existingVaccine && isAntiPacketActive(existingVaccine) && !queuedPacket &&
+                        (existingVaccine.sourceNodeId !== sourceNodeId ||
+                         existingVaccine.recipientNodeId !== recipientNodeId)) {
+                        return failAcknowledgement(socket, acknowledgement, "ANTI_PACKET_IDENTITY_CONFLICT");
+                    }
+                    if (countPendingAntiPackets() >= 8192 &&
+                        !pendingAntiPackets.get(sourceNodeId)?.has(messageId)) {
+                        return failAcknowledgement(socket, acknowledgement, "SERVER_RECEIPT_QUEUE_FULL");
+                    }
+                    if (deliveryVaccines.size >= 8192 && !deliveryVaccines.has(messageId)) {
+                        return failAcknowledgement(socket, acknowledgement, "SERVER_VACCINE_STORE_FULL");
+                    }
+                    deliveryVaccines.set(messageId, antiPacket);
 
 
                     /*
@@ -2627,6 +2655,10 @@ function buildAntiPacketSigningPayload(
 function validateAndVerifyAntiPacket(
     antiPacket
 ) {
+    if (antiPacket?.version !== 1 || antiPacket?.type !== "delivery_anti_packet" ||
+        Buffer.byteLength(JSON.stringify(antiPacket)) > 4096) {
+        return invalid("INVALID_ANTI_PACKET");
+    }
 
 
     if (
@@ -2695,8 +2727,12 @@ function validateAndVerifyAntiPacket(
         !Number.isSafeInteger(
             expiresAt
         ) ||
+        messageId.length > 128 ||
+        recipientSigningPublicKey.length > 512 || signature.length > 256 ||
         deliveredAt <= 0 ||
-        expiresAt <= deliveredAt
+        expiresAt <= deliveredAt ||
+        expiresAt - deliveredAt > 48 * 60 * 60 * 1000 ||
+        deliveredAt > Date.now() + CONNECTION_CONTROL_MAX_FUTURE_SKEW_MS
     ) {
 
         return invalid(
@@ -3297,116 +3333,6 @@ function validateAndVerifyConnectionResponse(
  * =============================================================
  */
 
-function validateMeshPacket(
-    packet
-) {
-
-
-    if (
-        !packet ||
-        typeof packet !==
-        "object"
-    ) {
-
-        return invalid(
-            "INVALID_MESH_PACKET"
-        );
-    }
-
-
-    const packetId =
-        normalizeString(
-            packet.packetId
-        );
-
-
-    const sourceNodeId =
-        normalizeNodeId(
-            packet.sourceNodeId
-        );
-
-
-    const destinationNodeId =
-        normalizeNodeId(
-            packet.destinationNodeId
-        );
-
-
-    const encryptedPayload =
-        normalizeString(
-            packet.encryptedPayload
-        );
-
-
-    const createdAt =
-        Number(
-            packet.createdAt
-        );
-
-
-    const expiresAt =
-        Number(
-            packet.expiresAt
-        );
-
-
-    const hopCount =
-        Number(
-            packet.hopCount
-        );
-
-
-    if (
-        !packetId ||
-        !sourceNodeId ||
-        !destinationNodeId ||
-        !encryptedPayload ||
-        !Number.isSafeInteger(
-            createdAt
-        ) ||
-        !Number.isSafeInteger(
-            expiresAt
-        ) ||
-        !Number.isSafeInteger(
-            hopCount
-        ) ||
-        createdAt <= 0 ||
-        expiresAt <= createdAt ||
-        hopCount < 0
-    ) {
-
-        return invalid(
-            "INVALID_MESH_PACKET_FIELDS"
-        );
-    }
-
-
-    /*
-     * Hop count is informational only.
-     *
-     * There is deliberately NO maximum-hop check.
-     */
-    if (
-        Date.now() >
-        expiresAt
-    ) {
-
-        return invalid(
-            "MESH_PACKET_EXPIRED"
-        );
-    }
-
-
-    return valid();
-}
-
-
-/*
- * =============================================================
- * ONLINE NODE ROUTING
- * =============================================================
- */
-
 function addOnlineSocket(
     nodeId,
     socketId
@@ -3589,43 +3515,16 @@ function queueMeshPacket(
     /*
      * packetId deduplication.
      */
+    if (!queue.has(packet.packetId) && queue.size >= MAX_QUEUED_PACKETS_PER_RECIPIENT) {
+        throw new Error("RECIPIENT_QUEUE_FULL");
+    }
     queue.set(
         packet.packetId,
         packet
     );
 
 
-    /*
-     * Backend memory protection only.
-     *
-     * NOT a mesh hop limit.
-     */
-    while (
-        queue.size >
-        MAX_QUEUED_PACKETS_PER_RECIPIENT
-    ) {
 
-
-        const oldestPacketId =
-            queue
-                .keys()
-                .next()
-                .value;
-
-
-        if (
-            oldestPacketId ===
-            undefined
-        ) {
-
-            break;
-        }
-
-
-        queue.delete(
-            oldestPacketId
-        );
-    }
 }
 
 
@@ -3988,6 +3887,10 @@ function queueConnectionControlPacket(
         );
 
 
+    if (countQueuedConnectionRequests() + countQueuedConnectionResponses() >= 4096 &&
+        !outerMap.get(destination)?.has(packetId)) {
+        throw new Error("SERVER_CONTROL_QUEUE_FULL");
+    }
     let queue =
         outerMap.get(
             destination
@@ -4487,12 +4390,8 @@ function normalizeString(
 function normalizeNodeId(
     value
 ) {
-
-
-    return normalizeString(
-        value
-    )
-        .toLowerCase();
+    const nodeId = normalizeString(value).toLowerCase();
+    return /^[0-9a-f]{64}$/.test(nodeId) ? nodeId : "";
 }
 
 

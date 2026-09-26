@@ -5,6 +5,7 @@
   "main": "src/server.js",
   "type": "module",
   "scripts": {
+    "test": "node --test src/*.test.js",
     "dev": "node --watch src/server.js",
     "start": "node src/server.js"
   },
