@@ -1,4 +1,5 @@
 import express from "express";
+import { createDurableWriter } from "./durable-writer.js";
 import { validateMeshPacket, MAX_PACKET_BYTES } from "./protocol.js";
 import cors from "cors";
 import http from "http";
@@ -81,6 +82,9 @@ const CLEANUP_INTERVAL_MS =
  */
 const MAX_QUEUED_PACKETS_PER_RECIPIENT =
     1000;
+// A packet count alone permits 4096 near-32KiB ciphertexts, too large for
+// a 256MiB process once the maps and a serialized snapshot coexist.
+const MAX_QUEUED_PACKET_BYTES = 24 * 1024 * 1024;
 
 
 /*
@@ -223,6 +227,7 @@ const onlineNodes =
  */
 const authenticatedSockets =
     new Map();
+const activeHandlers = new Set();
 
 
 /*
@@ -344,8 +349,15 @@ let persistenceMode =
         : "file";
 
 
-let persistenceWriteChain =
-    Promise.resolve();
+const durableWriter = createDurableWriter(buildDurableSnapshot, async serialized => {
+    if (redisClient) {
+        await redisClient.set(REDIS_STATE_KEY, serialized);
+    } else {
+        await mkdir(dirname(LOCAL_STATE_FILE), { recursive: true });
+        await writeFile(LOCAL_STATE_FILE + ".tmp", serialized, "utf8");
+        await rename(LOCAL_STATE_FILE + ".tmp", LOCAL_STATE_FILE);
+    }
+}, 750);
 
 
 function mapOfMapsToObject(
@@ -610,6 +622,8 @@ async function initializeDurableState() {
 
         redisClient =
             createClient({
+                disableOfflineQueue: true,
+                commandsQueueMaxLength: 16,
                 url:
                     REDIS_URL
             });
@@ -719,74 +733,7 @@ async function initializeDurableState() {
 
 
 function persistDurableState() {
-
-
-    const serialized =
-        JSON.stringify(
-            buildDurableSnapshot()
-        );
-
-
-    persistenceWriteChain =
-        persistenceWriteChain
-            .catch(
-                () => {}
-            )
-            .then(
-                async () => {
-
-
-                    if (
-                        redisClient
-                    ) {
-
-
-                        await redisClient
-                            .set(
-                                REDIS_STATE_KEY,
-                                serialized
-                            );
-
-
-                        return;
-                    }
-
-
-                    const directory =
-                        dirname(
-                            LOCAL_STATE_FILE
-                        );
-
-
-                    await mkdir(
-                        directory,
-                        {
-                            recursive: true
-                        }
-                    );
-
-
-                    const temporaryFile =
-                        LOCAL_STATE_FILE +
-                        ".tmp";
-
-
-                    await writeFile(
-                        temporaryFile,
-                        serialized,
-                        "utf8"
-                    );
-
-
-                    await rename(
-                        temporaryFile,
-                        LOCAL_STATE_FILE
-                    );
-                }
-            );
-
-
-    return persistenceWriteChain;
+    return durableWriter.persist();
 }
 
 
@@ -808,6 +755,13 @@ function countQueuedPackets() {
 
 
     return count;
+}
+function countQueuedPacketBytes() {
+    let bytes = 0;
+    for (const queue of queuedPackets.values()) {
+        for (const packet of queue.values()) bytes += (packet.encryptedPayload?.length ?? 0) + 512;
+    }
+    return bytes;
 }
 
 
@@ -1264,6 +1218,8 @@ app.get(
                 countQueuedConnectionResponses(),
             persistence:
                 persistenceMode,
+            writer:
+                durableWriter.diagnostics(),
             timestamp:
                 Date.now()
         });
@@ -1280,14 +1236,28 @@ app.get(
 io.on(
     "connection",
     socket => {
+        // Bound async handlers retained while persistence is slow/unavailable.
+        let activeForSocket = 0;
+        const register = socket.on.bind(socket);
+        socket.on = (event, handler) => register(event, (...args) => {
+            if (shuttingDown && event !== "disconnect") return;
+            const result = handler(...args);
+            if (result && typeof result.then === "function") {
+                activeForSocket++;
+                activeHandlers.add(result);
+                const done = () => { activeForSocket--; activeHandlers.delete(result); };
+                result.then(done, done);
+            }
+        });
         // Bound event work even for self-created, correctly authenticated identities.
         let tokens = 256;
         let lastRefill = Date.now();
         socket.use(([event, ...args], next) => {
+            if (shuttingDown) return;
             const now = Date.now();
             tokens = Math.min(256, tokens + (now - lastRefill) / 50);
             lastRefill = now;
-            if (tokens < 1) {
+            if (tokens < 1 || activeForSocket >= 32 || activeHandlers.size >= 256) {
                 const ack = args.at(-1);
                 if (typeof ack === "function") ack({ ok: false, error: "RATE_LIMITED" });
                 return;
@@ -1785,6 +1755,11 @@ io.on(
                             packetId
                         );
 
+                    if (vaccine && isAntiPacketActive(vaccine) &&
+                        !antiPacketMatchesMeshPacket(vaccine, packet)) {
+                        return failAcknowledgement(socket, acknowledgement, "PACKET_ID_CONFLICT");
+                    }
+
 
                     if (
                         vaccine &&
@@ -1796,6 +1771,8 @@ io.on(
                             packet
                         )
                     ) {
+
+                        await durableWriter.barrier();
 
 
                         successfulAcknowledgement(
@@ -1820,15 +1797,22 @@ io.on(
                     /*
                      * Persist in backend queue FIRST.
                      *
-                     * In this version "persist" means in-memory.
-                     *
-                     * Later this exact interface can move to Redis.
+                     * Redis or the atomic local file must contain this state
+                     * before the sender receives an accepted acknowledgement.
                      */
                     if (countQueuedPackets() >= 4096 &&
                         !findQueuedPacket(destinationNodeId, packetId)) {
                         return failAcknowledgement(socket, acknowledgement, "SERVER_QUEUE_FULL");
                     }
-                    queueMeshPacket(destinationNodeId, packet);
+                    const existingPacket = findQueuedPacket(destinationNodeId, packetId);
+                    if (!existingPacket && countQueuedPacketBytes() + packet.encryptedPayload.length + 512 > MAX_QUEUED_PACKET_BYTES) {
+                        return failAcknowledgement(socket, acknowledgement, "SERVER_QUEUE_BYTES_FULL");
+                    }
+                    const duplicate = existingPacket && JSON.stringify(existingPacket) === JSON.stringify(packet);
+                    if (existingPacket && !duplicate) {
+                        return failAcknowledgement(socket, acknowledgement, "PACKET_ID_CONFLICT");
+                    }
+                    if (!duplicate) queueMeshPacket(destinationNodeId, packet);
 
 
                     /*
@@ -1836,7 +1820,7 @@ io.on(
                      * the sender. If this write fails, the handler falls
                      * into the catch block and the client will retry.
                      */
-                    await persistDurableState();
+                    await (duplicate ? durableWriter.barrier() : persistDurableState());
 
 
                     /*
@@ -2034,7 +2018,14 @@ io.on(
                      * Store backend vaccine first.
                      */
                     const existingVaccine = deliveryVaccines.get(messageId);
-                    if (existingVaccine && isAntiPacketActive(existingVaccine) && !queuedPacket &&
+                    if (existingVaccine && isAntiPacketActive(existingVaccine) &&
+                        existingVaccine.sourceNodeId === sourceNodeId &&
+                        existingVaccine.recipientNodeId === recipientNodeId &&
+                        pendingAntiPackets.get(sourceNodeId)?.has(messageId)) {
+                        await durableWriter.barrier();
+                        return successfulAcknowledgement(acknowledgement, { accepted: true, messageId, duplicate: true });
+                    }
+                    if (existingVaccine && isAntiPacketActive(existingVaccine) &&
                         (existingVaccine.sourceNodeId !== sourceNodeId ||
                          existingVaccine.recipientNodeId !== recipientNodeId)) {
                         return failAcknowledgement(socket, acknowledgement, "ANTI_PACKET_IDENTITY_CONFLICT");
@@ -3458,6 +3449,15 @@ function emitToNode(
             destinationSocket
         ) {
 
+            // Retain proofs durably until expiry, but offer each logical proof
+            // only once per live socket. Reconnect creates a fresh repair window.
+            if (eventName === "internet:anti_packet") {
+                const offered = destinationSocket.data.offeredAntiPackets ??= new Set();
+                if (offered.has(payload.messageId)) continue;
+                offered.add(payload.messageId);
+                if (offered.size > 8192) offered.delete(offered.values().next().value);
+            }
+
             destinationSocket.emit(
                 eventName,
                 payload
@@ -4290,7 +4290,7 @@ function isAntiPacketActive(
  * =============================================================
  */
 
-setInterval(
+const cleanupTimer = setInterval(
     async () => {
 
 
@@ -4357,10 +4357,17 @@ setInterval(
 /*
  * Don't keep Node alive solely because of the cleanup timer.
  */
-setInterval(
-    () => {},
-    2 ** 31 - 1
-).unref();
+cleanupTimer.unref();
+const diagnosticsTimer = setInterval(() => {
+    console.log("[health]", JSON.stringify({ memory: process.memoryUsage(),
+        queuedPackets: countQueuedPackets(), deliveryVaccines: deliveryVaccines.size,
+        queuedPacketBytes: countQueuedPacketBytes(),
+        pendingAntiPackets: countPendingAntiPackets(),
+        connectionRequests: countQueuedConnectionRequests(),
+        connectionResponses: countQueuedConnectionResponses(),
+        persistence: durableWriter.diagnostics() }));
+}, 60_000);
+diagnosticsTimer.unref();
 
 
 /*
@@ -4554,6 +4561,11 @@ async function shutdown(
 
     shuttingDown =
         true;
+    clearInterval(cleanupTimer);
+    clearInterval(diagnosticsTimer);
+    // Stop ingress before the final barrier. Already-running handlers mutate
+    // before their persistence await; flush drains their coalesced batches.
+    io.disconnectSockets(true);
 
 
     console.log(
@@ -4564,8 +4576,9 @@ async function shutdown(
     try {
 
 
+        await Promise.allSettled([...activeHandlers]);
         await persistDurableState();
-
+        await durableWriter.flush();
 
         await new Promise(
             resolveClose => {

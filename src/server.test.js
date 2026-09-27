@@ -99,6 +99,9 @@ test("real Socket.IO auth, offline queue, forgery rejection, and signed delivery
     assert.equal((await a.request("internet:packet", { ...packet, hopCount: 9 })).ok, false);
     assert.equal((await a.request("internet:packet", { ...packet, sourceNodeId: receiver.nodeId })).ok, false);
     assert.equal((await a.request("internet:packet", packet)).ok, true);
+    assert.equal((await a.request("internet:packet", packet)).ok, true, "duplicate is idempotent");
+    assert.equal((await a.request("internet:packet", { ...packet, expiresAt: packet.expiresAt - 1000 })).ok,
+        false, "an accepted packet ID cannot be rewritten with altered metadata");
     assert.ok((await readFile(stateFile, "utf8")).includes(packet.packetId), "accepted packet is persisted");
     // The recipient was offline when the packet was accepted.
     const b = await client(port);
@@ -113,6 +116,11 @@ test("real Socket.IO auth, offline queue, forgery rejection, and signed delivery
     assert.equal((await a.request("internet:anti_packet", antiPacket)).ok, false, "only recipient uploads proof");
     assert.equal((await b.request("internet:anti_packet", { ...antiPacket, signature: "AAAA" })).ok, false);
     assert.equal((await b.request("internet:anti_packet", antiPacket)).ok, true);
+    const writesBeforeDuplicate = (await (await fetch(`http://127.0.0.1:${port}/health`)).json()).writer.writes;
+    assert.equal((await b.request("internet:anti_packet", antiPacket)).ok, true,
+        "duplicate proof retains the durable delivery decision");
+    assert.equal((await (await fetch(`http://127.0.0.1:${port}/health`)).json()).writer.writes,
+        writesBeforeDuplicate, "duplicate proof does not write the full snapshot");
     assert.equal((await a.event("internet:anti_packet")).messageId, packet.packetId);
     const conflict = { ...antiPacket, sourceNodeId: "c".repeat(64) };
     conflict.signature = sign("sha256", Buffer.from(
